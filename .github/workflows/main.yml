@@ -1,0 +1,83 @@
+name: Build GrizGram APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      rename_ui_texts:
+        description: "Заменить слово Telegram на GrizGram во всех текстах интерфейса (по умолчанию только название приложения)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Шаг 1: только название приложения (ключи AppName / AppNameBeta / app_name)
+      - name: Rename app name -> GrizGram
+        run: |
+          echo "--- до ---"
+          grep -rn -E 'name="(AppName|AppNameBeta|app_name)"' --include=strings.xml . || true
+
+          find . -path '*/res/values*/strings*.xml' -not -path '*/build/*' -print0 \
+            | xargs -0 sed -i -E 's#(<string name="(AppName|AppNameBeta|app_name)"[^>]*>)[^<]*(</string>)#\1GrizGram\3#'
+
+          echo "--- после ---"
+          grep -rn -E 'name="(AppName|AppNameBeta|app_name)"' --include=strings.xml . || true
+
+          echo "--- изменённые файлы ---"
+          git diff --stat
+
+          echo "--- android:label в манифесте ---"
+          grep -rn 'android:label' --include=AndroidManifest.xml . || true
+
+          if git diff --quiet; then
+            echo "::warning::Название не изменилось: ключ app_name не найден. Пришлите вывод android:label выше."
+          fi
+
+      # Шаг 2 (по желанию): слово Telegram в текстах интерфейса, только внутри тегов, ключи не трогаются
+      - name: Rename Telegram in UI texts (optional)
+        if: ${{ inputs.rename_ui_texts }}
+        run: |
+          find . -path '*/res/values*/strings*.xml' -not -path '*/build/*' -print0 \
+            | xargs -0 perl -i -pe 's{>([^<]*)<}{my $t=$1; $t =~ s/Telegram/GrizGram/g; ">$t<"}ge'
+          git diff --stat
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # На ubuntu-latest Android SDK уже предустановлен, докачиваем только нужные компоненты
+      - name: Install SDK/NDK components
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/cmdline-tools" || true
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "build-tools;30.0.3" "ndk;21.4.7075529"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build APK
+        run: ./gradlew :TMessagesProj_App:assembleAfatRelease --stacktrace
+
+      - name: Find APK
+        run: find . -type f -name "*.apk" -print
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GrizGram-APK
+          path: "**/build/outputs/apk/**/*.apk"
+          if-no-files-found: error
+          
