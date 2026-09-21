@@ -1,0 +1,128 @@
+name: Build GrizGram APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- Название: Telegram -> GrizGram ----------
+
+      - name: App label in Manifest
+        run: |
+          echo "--- label до ---"
+          grep -rn 'android:label' --include=AndroidManifest.xml . || true
+          find . -name AndroidManifest.xml -not -path "*/build/*" \
+            -exec sed -i 's/android:label="Telegram"/android:label="GrizGram"/g' {} +
+          echo "--- label после ---"
+          grep -rn 'android:label' --include=AndroidManifest.xml . || true
+
+      - name: Rename Telegram -> GrizGram (only text in strings)
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+
+          TEXT = re.compile(r'>([^<]*)<')
+          # только отдельное слово; не трогаем ссылки, @username, TelegramTips и т.п.
+          WORD = re.compile(r'(?<![A-Za-z0-9_/@.])Telegram(?![A-Za-z0-9_])')
+
+          def fix(m):
+              return ">" + WORD.sub("GrizGram", m.group(1)) + "<"
+
+          changed = 0
+          for f in pathlib.Path(".").rglob("strings*.xml"):
+              if "build" in f.parts or not f.parent.name.startswith("values"):
+                  continue
+              s = f.read_text(encoding="utf-8")
+              n = TEXT.sub(fix, s)
+              if n != s:
+                  f.write_text(n, encoding="utf-8")
+                  changed += 1
+          print("files changed:", changed)
+          PY
+          echo "--- Page1Title (экран приветствия) ---"
+          grep -rn 'name="Page1Title"' --include=*.xml . || true
+          echo "--- AppName / app_name ---"
+          grep -rn 'name="AppName"\|name="app_name"' --include=strings*.xml . || true
+          echo "--- Telegram, оставшиеся в строках ---"
+          grep -rn '>[^<]*Telegram' --include=strings*.xml . | grep -v "/build/" | head -40 || true
+
+      # ---------- Имя пакета: com.grizgram.one ----------
+
+      - name: Set applicationId = com.grizgram.one
+        run: |
+          echo "--- до ---"
+          grep -rn "applicationId" --include=build.gradle . || true
+          sed -i -E "s/(applicationId[[:space:]]*=?[[:space:]]*)[\"'][^\"']*[\"']/\1\"com.grizgram.one\"/" \
+            TMessagesProj/build.gradle TMessagesProj_App/build.gradle
+          echo "--- после ---"
+          grep -rn "applicationId" --include=build.gradle . || true
+
+      - name: Patch google-services.json for new package
+        run: |
+          python3 - <<'PY'
+          import json, glob, copy
+          NEW = "com.grizgram.one"
+          for p in glob.glob("**/google-services.json", recursive=True):
+              d = json.load(open(p, encoding="utf-8"))
+              clients = d.get("client", [])
+              if not clients:
+                  continue
+              if any(c["client_info"]["android_client_info"]["package_name"] == NEW for c in clients):
+                  continue
+              c = copy.deepcopy(clients[0])
+              c["client_info"]["android_client_info"]["package_name"] = NEW
+              clients.append(c)
+              json.dump(d, open(p, "w", encoding="utf-8"), indent=2)
+              print("patched", p)
+          PY
+
+      - name: Manifest diagnostics (hardcoded package names)
+        run: |
+          grep -rn "org.telegram.messenger" --include=AndroidManifest.xml . | grep -iE "permission|authorities" || true
+
+      # ---------- Сборка ----------
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install SDK/NDK components
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then
+            SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          fi
+          echo "sdkmanager: $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "build-tools;30.0.3" "ndk;21.4.7075529"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build APK
+        run: ./gradlew :TMessagesProj_App:assembleAfatRelease --stacktrace
+
+      - name: Verify package and label
+        run: |
+          APK=$(find . -type f -name "*.apk" | head -1)
+          echo "APK: $APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | grep -E "^package:|^application-label:"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GrizGram-APK
+          path: "**/build/outputs/apk/**/*.apk"
+          if-no-files-found: error
